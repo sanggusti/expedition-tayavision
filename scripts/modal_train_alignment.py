@@ -40,7 +40,7 @@ image = (
     gpu="A10G",
     volumes={"/data": volume, "/models": models_volume},
     secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")],
-    timeout=3600 * 6,
+    timeout=3600 * 24,
 )
 def train():
     import sys
