@@ -46,6 +46,7 @@ def train(
     training_config: AlignmentConfig,
     checkpoint_dir: Path,
     compute_dtype: torch.dtype,
+    projector_output_norms: list,
     step_offset: int = 0,
 ):
     model.train()
@@ -78,10 +79,13 @@ def train(
                 optimizer.zero_grad()
 
                 opt_step = (step + 1) // training_config.grad_acc_steps
+                avg_projector_norm = sum(projector_output_norms) / len(projector_output_norms)
+                projector_output_norms.clear()
                 wandb.log({
                     "train/loss": accumulated_loss,
                     "train/grad_norm": grad_norm.item(),
                     "train/lr": lr_scheduler.get_last_lr()[0],
+                    "train/projector_output_norm": avg_projector_norm,
                 }, step=opt_step)
 
                 if opt_step % training_config.logging_steps == 0:
@@ -151,6 +155,13 @@ def main(
     model.language_model.to(dtype=compute_dtype)
 
     model.language_model.gradient_checkpointing_enable()
+
+    projector_output_norms = []
+    model.multi_modal_projector.register_forward_hook(
+        lambda m, i, o: projector_output_norms.append(
+            o.detach().float().norm(dim=-1).mean().item()
+        )
+    )
 
     model = torch.compile(model)
 
@@ -226,6 +237,7 @@ def main(
         training_config=training_config,
         checkpoint_dir=checkpoint_dir,
         compute_dtype=compute_dtype,
+        projector_output_norms=projector_output_norms,
         step_offset=resume_step,
     )
 
@@ -234,5 +246,5 @@ def main(
 if __name__ == "__main__":
     main(
         training_config=AlignmentConfig(),
-        model_config=TinyAyaVisionConfig(),
+        model_config=TinyAyaVisionConfig.for_global(),
     )
