@@ -79,13 +79,15 @@ def train(
                 optimizer.zero_grad()
 
                 opt_step = (step + 1) // training_config.grad_acc_steps
-                avg_projector_norm = sum(projector_output_norms) / len(projector_output_norms)
+                avg_projector_norm = sum(m for m, s in projector_output_norms) / len(projector_output_norms)
+                avg_projector_norm_std = sum(s for m, s in projector_output_norms) / len(projector_output_norms)
                 projector_output_norms.clear()
                 wandb.log({
                     "train/loss": accumulated_loss,
                     "train/grad_norm": grad_norm.item(),
                     "train/lr": lr_scheduler.get_last_lr()[0],
                     "train/projector_output_norm": avg_projector_norm,
+                    "train/projector_output_norm_std": avg_projector_norm_std,
                 }, step=opt_step)
 
                 if opt_step % training_config.logging_steps == 0:
@@ -157,11 +159,10 @@ def main(
     model.language_model.gradient_checkpointing_enable()
 
     projector_output_norms = []
-    model.multi_modal_projector.register_forward_hook(
-        lambda m, i, o: projector_output_norms.append(
-            o.detach().float().norm(dim=-1).mean().item()
-        )
-    )
+    def _capture_norm(m, i, o):
+        norms = o.detach().float().norm(dim=-1)
+        projector_output_norms.append((norms.mean().item(), norms.std().item()))
+    model.multi_modal_projector.register_forward_hook(_capture_norm)
 
     model = torch.compile(model)
 
