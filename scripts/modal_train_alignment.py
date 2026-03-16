@@ -12,10 +12,10 @@ models_volume = modal.Volume.from_name("tayavision-models", create_if_missing=Tr
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install(
-        "torch",
+    .uv_pip_install(
+        "torch==2.9.1",
         "torchvision",
-        "transformers",
+        "transformers==4.56.2",
         "datasets",
         "accelerate",
         "huggingface_hub",
@@ -27,6 +27,8 @@ image = (
         "tqdm",
         "einops",
         "wandb",
+        "hydra-core",
+        "omegaconf",
     )
     .add_local_dir("config", remote_path="/root/project/config")
     .add_local_dir("src", remote_path="/root/project/src")
@@ -42,31 +44,21 @@ image = (
     secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")],
     timeout=3600 * 24,
 )
-class Trainer:
-    @modal.method()
-    def train(self, resume_run_id: str | None = None, config_json: str | None = None):
-        import json
-        import sys
-        sys.path.insert(0, "/root/project")
+def train(overrides: list[str]):
+    import sys
+    sys.path.insert(0, "/root/project")
 
-        from config.training_config import AlignmentConfig
-        from config.model_config import TinyAyaVisionConfig
-        from pipeline.train_alignment import main
+    # Pass overrides directly to the hydra CLI
+    sys.argv = ["train_alignment.py"] + overrides
 
-        overrides = json.loads(config_json) if config_json else {}
-        training_overrides = overrides.get("training", {})
-        model_overrides = overrides.get("model", {})
-        main(
-            training_config=AlignmentConfig(**training_overrides),
-            model_config=TinyAyaVisionConfig(**model_overrides),
-            resume_run_id=resume_run_id,
-        )
+    from pipeline.train_alignment import main
+    main()
 
 
 @app.local_entrypoint()
-def run(resume_run_id: str = None, config: str = None, gpu: str = "A100"):
-    config_json = None
-    if config:
-        with open(config) as f:
-            config_json = f.read()
-    Trainer.with_options(gpu=gpu)().train.remote(resume_run_id=resume_run_id, config_json=config_json)
+def run(*overrides: str):
+    """
+    Run the alignment training. Any extra arguments will be passed to Hydra as overrides.
+    Example: modal run scripts/modal_train_alignment.py vision=siglip training.batch_size=16 resume=YOUR_UUID
+    """
+    train.remote(list(overrides))
