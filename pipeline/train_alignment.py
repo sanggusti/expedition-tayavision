@@ -66,12 +66,16 @@ def train(
                 batch["pixel_values"].to(device),
                 batch["labels"].to(device),
             )
+            image_grid_hws = batch.get("image_grid_hws")
+            if image_grid_hws is not None:
+                image_grid_hws = image_grid_hws.to(device)
 
             with torch.autocast("cuda", dtype=compute_dtype):
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     pixel_values=pixel_values,
+                    image_grid_hws=image_grid_hws,
                     labels=labels,
                 )
                 loss = outputs.loss / training_config.grad_acc_steps

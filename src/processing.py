@@ -44,8 +44,9 @@ class TinyAyaVisionProcessor:
         """Compute how many <image> tokens each image expands to.
 
         For SigLIP: always config.num_tokens_after_shuffle (196).
-        For MoonViT: H * W * tokens_per_tile per image, where H and W come
-                     from image_grid_hws returned by the MoonViT image processor.
+        For MoonViT: H * W per image, where H and W come from image_grid_hws
+                     returned by the MoonViT image processor (already accounts
+                     for internal tiling/compression).
         """
         if self.config.vision_encoder_type == "moonvit":
             if image_grid_hws is None:
@@ -53,8 +54,8 @@ class TinyAyaVisionProcessor:
                     "image_grid_hws is required for MoonViT to determine token counts. "
                     "Run the image processor first and pass image_grid_hws here."
                 )
-            # image_grid_hws: (B, 2) — [H, W] tile grid per image
-            return (image_grid_hws[:, 0] * image_grid_hws[:, 1] * self.config.tokens_per_tile).tolist()
+            # image_grid_hws: (B, 2) — [H, W] grid per image; H * W = total visual tokens
+            return (image_grid_hws[:, 0] * image_grid_hws[:, 1]).tolist()
         else:
             return [self.config.num_tokens_after_shuffle] * n_images
 
@@ -62,6 +63,7 @@ class TinyAyaVisionProcessor:
         self,
         text: str | list[str],
         images: Image.Image | list[Image.Image] | None = None,
+        image_grid_hws: torch.Tensor | None = None,
         padding: bool | str = False,
         truncation: bool = False,
         max_length: int | None = None,
@@ -89,7 +91,6 @@ class TinyAyaVisionProcessor:
             text = [text]
 
         result: dict[str, torch.Tensor] = {}
-        image_grid_hws = None
 
         # Process images first to learn token counts (needed for MoonViT)
         if images is not None:
