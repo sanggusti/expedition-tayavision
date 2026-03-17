@@ -21,8 +21,10 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
+from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import wandb
@@ -33,7 +35,7 @@ from config.model_config import TinyAyaVisionConfig
 from config.training_config import InstructConfig
 from models.tiny_aya_vision import TinyAyaVisionForConditionalGeneration
 from pipeline.data import InstructDataset, collate_fn
-from scripts.apply_lora import apply_lora, get_lora_optimizer_groups
+from pipeline.apply_lora import apply_lora, get_lora_optimizer_groups
 from src.processing import TinyAyaVisionProcessor
 
 
@@ -56,12 +58,12 @@ def cleanup_ddp():
 
 
 def _unwrap_model(model):
-    """Unwrap DDP and torch.compile wrappers to access the raw module."""
+    """Unwrap torch.compile and DDP wrappers to access the raw module."""
     raw = model
-    if hasattr(raw, "module"):       # DDP
-        raw = raw.module
     if hasattr(raw, "_orig_mod"):    # torch.compile
         raw = raw._orig_mod
+    if hasattr(raw, "module"):       # DDP
+        raw = raw.module
     return raw
 
 
@@ -91,6 +93,75 @@ def find_latest_checkpoint(checkpoint_dir: Path) -> Path | None:
     return max(checkpoints, key=extract_step)
 
 
+@torch.no_grad()
+def generate_samples(
+    model,
+    batch: dict,
+    processor: TinyAyaVisionProcessor,
+    compute_dtype: torch.dtype,
+    device: torch.device,
+    max_new_tokens: int = 256,
+    num_samples: int = 2,
+) -> list[dict[str, str]]:
+    """Generate text from the first `num_samples` items in a batch.
+
+    Extracts the prompt (tokens before the first assistant response, i.e.
+    where labels == -100) and runs generation. Returns a list of dicts
+    with 'prompt' and 'generation' decoded strings.
+    """
+    raw = _unwrap_model(model)
+    was_training = raw.training
+    raw.eval()
+
+    results = []
+    n = min(num_samples, batch["input_ids"].size(0))
+    for i in range(n):
+        labels_i = batch["labels"][i]
+        # Find first non-masked label (start of first assistant response)
+        response_mask = labels_i != -100
+        if response_mask.any():
+            prompt_len = response_mask.nonzero(as_tuple=False)[0].item()
+        else:
+            prompt_len = labels_i.size(0)
+
+        prompt_ids = batch["input_ids"][i, :prompt_len].unsqueeze(0).to(device)
+        prompt_mask = batch["attention_mask"][i, :prompt_len].unsqueeze(0).to(device)
+        pixel_values = batch["pixel_values"][i].unsqueeze(0).to(device)
+
+        with torch.autocast("cuda", dtype=compute_dtype):
+            gen_ids = raw.generate(
+                input_ids=prompt_ids,
+                attention_mask=prompt_mask,
+                pixel_values=pixel_values,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+
+        # Decode only newly generated tokens
+        new_ids = gen_ids[0, prompt_len:]
+        prompt_text = processor.tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
+        gen_text = processor.tokenizer.decode(new_ids, skip_special_tokens=True)
+
+        # Denormalize pixel values → [0, 255] PIL image for wandb
+        img_tensor = batch["pixel_values"][i].float().cpu()
+        mean = torch.tensor(processor.image_processor.image_mean).view(3, 1, 1)
+        std = torch.tensor(processor.image_processor.image_std).view(3, 1, 1)
+        img_tensor = (img_tensor * std + mean).clamp(0, 1)
+        img_pil = Image.fromarray(
+            (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        )
+
+        results.append({
+            "image": wandb.Image(img_pil),
+            "prompt": prompt_text,
+            "generation": gen_text,
+        })
+
+    if was_training:
+        raw.train()
+    return results
+
+
 def train(
     model,
     dataloader: torch.utils.data.DataLoader,
@@ -101,12 +172,25 @@ def train(
     checkpoint_dir: Path,
     compute_dtype: torch.dtype,
     device: torch.device,
+    processor: TinyAyaVisionProcessor | None = None,
     step_offset: int = 0,
 ):
     model.train()
     accumulated_loss = 0.0
     use_ddp = dist.is_initialized()
     is_main = (not use_ddp) or dist.get_rank() == 0
+
+    # Accumulate generation samples across save steps
+    generation_rows = []
+
+    # Forward hook to capture projector output norms
+    norm_cache = {}
+    raw = _unwrap_model(model)
+    def _projector_hook(module, input, output):
+        with torch.no_grad():
+            norms = output.detach().float().norm(dim=-1)
+            norm_cache["projector_token"] = norms
+    hook_handle = raw.multi_modal_projector.register_forward_hook(_projector_hook)
 
     for epoch in range(training_config.num_epochs):
         if sampler is not None:
@@ -137,6 +221,13 @@ def train(
             accumulated_loss += loss.item()
 
             if (step + 1) % training_config.grad_acc_steps == 0:
+                # Compute grad norms separately for projector and LoRA
+                projector_params = [p for p in raw.multi_modal_projector.parameters() if p.requires_grad and p.grad is not None]
+                lora_params = [p for p in raw.language_model.parameters() if p.requires_grad and p.grad is not None]
+
+                projector_grad_norm = torch.nn.utils.clip_grad_norm_(projector_params, float("inf"))
+                lora_grad_norm = torch.nn.utils.clip_grad_norm_(lora_params, float("inf"))
+
                 # Clip all trainable parameters (projector + LoRA)
                 trainable_params = [p for p in model.parameters() if p.requires_grad]
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, training_config.max_grad_norm)
@@ -146,12 +237,36 @@ def train(
 
                 opt_step = (step + 1) // training_config.grad_acc_steps
 
+                # Token masking stats (computed before logging, outside is_main guard for clarity)
+                num_total_tokens = labels.numel()
+                num_masked_tokens = (labels == -100).sum().item()
+                num_response_tokens = num_total_tokens - num_masked_tokens
+                masked_pct = 100.0 * num_masked_tokens / num_total_tokens
+
                 if is_main:
-                    wandb.log({
+                    log_dict = {
                         "train/loss": accumulated_loss,
                         "train/grad_norm": grad_norm.item(),
+                        "train/grad_norm_projector": projector_grad_norm.item(),
+                        "train/grad_norm_lora": lora_grad_norm.item(),
                         "train/lr": lr_scheduler.get_last_lr()[0],
-                    }, step=opt_step)
+                        "train/response_tokens": num_response_tokens,
+                        "train/masked_pct": masked_pct,
+                    }
+
+                    if "projector_token" in norm_cache:
+                        pn = norm_cache["projector_token"]
+                        log_dict["norms/projector_token_mean"] = pn.mean().item()
+                        log_dict["norms/projector_token_std"] = pn.std().item()
+                        log_dict["norms/projector_token_min"] = pn.min().item()
+                        log_dict["norms/projector_token_max"] = pn.max().item()
+
+                        emb_w = raw.get_input_embeddings().weight.detach().float()
+                        emb_norms = emb_w.norm(dim=-1)
+                        log_dict["norms/emb_matrix_mean"] = emb_norms.mean().item()
+                        log_dict["norms/emb_matrix_std"] = emb_norms.std().item()
+                        log_dict["norms/emb_matrix_min"] = emb_norms.min().item()
+                        log_dict["norms/emb_matrix_max"] = emb_norms.max().item()
 
                     pbar.set_postfix(loss=f"{accumulated_loss:.4f}", lr=f"{lr_scheduler.get_last_lr()[0]:.2e}", gnorm=f"{grad_norm.item():.2f}")
 
@@ -161,11 +276,27 @@ def train(
                     if opt_step % training_config.save_steps == 0:
                         save_checkpoint(checkpoint_dir, step + 1, model, optimizer, lr_scheduler)
 
+                        if processor is not None:
+                            samples = generate_samples(
+                                model, batch, processor,
+                                compute_dtype, device,
+                            )
+                            for s in samples:
+                                generation_rows.append([opt_step, s["image"], s["prompt"], s["generation"]])
+                            table = wandb.Table(
+                                columns=["step", "image", "prompt", "generation"],
+                                data=generation_rows,
+                            )
+                            log_dict["generations"] = table
+
+                    wandb.log(log_dict, step=opt_step)
+
                 if use_ddp:
                     dist.barrier()
 
                 accumulated_loss = 0.0
 
+    hook_handle.remove()
     if is_main:
         save_checkpoint(checkpoint_dir, step + 1, model, optimizer, lr_scheduler)
     if use_ddp:
@@ -258,11 +389,13 @@ def main(
     model.vision_encoder.to(dtype=compute_dtype, non_blocking=True)
 
     model.language_model.base_model.enable_input_require_grads()
-    # model.language_model.base_model.gradient_checkpointing_enable()
+    
+    # if training_config.enable_gradient_checkpointing:
+        # model.language_model.base_model.gradient_checkpointing_enable() # This is causing a problem wrt the current torch.compile and DDP setup, hence disabling it
 
-    model = torch.compile(model)
     if use_ddp:
         model = DDP(model, device_ids=[local_rank])
+    model = torch.compile(model)
 
     resume_step = 0
     if resume_run_id:
@@ -366,6 +499,7 @@ def main(
         checkpoint_dir=checkpoint_dir,
         compute_dtype=compute_dtype,
         device=device,
+        processor=processor,
         step_offset=resume_step,
     )
 

@@ -11,7 +11,7 @@ import torch.nn as nn
 from peft import LoraConfig, TaskType
 
 from config.lora_config import LoraAdapterConfig
-from scripts.apply_lora import count_parameters, get_lora_optimizer_groups
+from pipeline.apply_lora import count_parameters, get_lora_optimizer_groups
 
 
 # ---------------------------------------------------------------------------
