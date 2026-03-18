@@ -63,7 +63,7 @@ class AlignmentDataset(torch.utils.data.Dataset):
         pixel_values = processed["pixel_values"].squeeze(0)
 
         processed_prompt = self.processor(
-            text=prompt,
+            text=prompt_text,
             image_grid_hws=processed.get("image_grid_hws"),
         )
         num_prompt_tokens = processed_prompt["input_ids"].shape[-1]
