@@ -79,6 +79,7 @@ def train(
                     pixel_values=pixel_values,
                     image_grid_hws=image_grid_hws,
                     labels=labels,
+                    use_cache=False,
                 )
                 ce_loss = outputs.loss / training_config.grad_acc_steps
 

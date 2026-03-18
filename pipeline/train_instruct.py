@@ -231,6 +231,7 @@ def train(
                     attention_mask=attention_mask,
                     pixel_values=pixel_values,
                     labels=labels,
+                    use_cache=False,
                 )
                 loss = outputs.loss / training_config.grad_acc_steps
             loss.backward()
