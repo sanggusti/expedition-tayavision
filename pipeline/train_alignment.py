@@ -1,9 +1,15 @@
 import json
 import re
+import sys
 import uuid
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 import wandb
@@ -62,21 +68,27 @@ def train(
                 batch["pixel_values"].to(device),
                 batch["labels"].to(device),
             )
+            image_grid_hws = batch.get("image_grid_hws")
+            if image_grid_hws is not None:
+                image_grid_hws = image_grid_hws.to(device)
 
             with torch.autocast("cuda", dtype=compute_dtype):
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     pixel_values=pixel_values,
+                    image_grid_hws=image_grid_hws,
                     labels=labels,
                 )
                 ce_loss = outputs.loss / training_config.grad_acc_steps
 
                 token_embeddings = model.language_model.get_input_embeddings().weight # (vocab size, D)
-                image_hidden_states = outputs.image_hidden_states # (B, V, D)
+                image_hidden_states = outputs.image_hidden_states # (B, V, D) or (total_tokens, D)
 
-                align_reg_loss = (token_embeddings.mean(dim=0) - image_hidden_states.mean(dim=(0, 1))).square().sum() \
-                                + (token_embeddings.std(dim=0) - image_hidden_states.std(dim=(0, 1))).square().sum()
+                # Flatten to 2-D for both SigLIP (B, V, D) and MoonViT (total_tokens, D)
+                ihs = image_hidden_states.reshape(-1, image_hidden_states.shape[-1])
+                align_reg_loss = (token_embeddings.mean(dim=0) - ihs.mean(dim=0)).square().sum() \
+                                + (token_embeddings.std(dim=0) - ihs.std(dim=0)).square().sum()
                 align_reg_loss /= training_config.grad_acc_steps
                 
             loss = ce_loss + training_config.embed_align_reg * align_reg_loss
@@ -120,13 +132,26 @@ def train(
     print("Training complete")
 
 
-def main(
-    training_config: AlignmentConfig,
-    model_config: TinyAyaVisionConfig,
-    resume_run_id: str | None = None,
-):
-    torch.manual_seed(training_config.seed)
-    torch.cuda.manual_seed_all(training_config.seed)
+def run(cfg: DictConfig):
+    """Core training logic. Can be called directly with a composed DictConfig."""
+    # 1. Translate omegaconf nodes back to plain dictionaries
+    training_dict = OmegaConf.to_container(cfg.training, resolve=True)
+    
+    # 2. Re-instantiate your configurations to maintain types downwards
+    training_config = AlignmentConfig(**training_dict)
+    
+    # Instantiate Model Config 
+    model_config = TinyAyaVisionConfig.for_encoder(
+        cfg.vision.vision_encoder_type, 
+        llm=cfg.llm
+    )
+    
+    # Optional logic: If vision params scale further inside the yaml than presets:
+    # model_dict = OmegaConf.to_container(cfg.vision, resolve=True)
+    # model_config = TinyAyaVisionConfig(**model_dict, llm=cfg.llm)
+
+    # Allow CLI-based resuming (e.g. `python train.py resume=xyz123`)
+    resume_run_id = cfg.get("resume", None)
 
     if resume_run_id:
         run_id = resume_run_id
@@ -140,6 +165,7 @@ def main(
 
     config_path = checkpoint_dir / "config.json"
     if not config_path.exists():
+        import json
         with open(config_path, "w") as f:
             json.dump({
                 "training_config": asdict(training_config),
@@ -147,7 +173,9 @@ def main(
             }, f, indent=2)
 
     wandb.init(
-        project="tayavision",
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        mode=cfg.wandb.mode,
         name=run_id,
         id=run_id.replace("-", ""),
         resume="allow",
@@ -262,8 +290,11 @@ def main(
 
     wandb.finish()
 
+
+@hydra.main(version_base="1.3", config_path="../config", config_name="config")
+def main(cfg: DictConfig):
+    run(cfg)
+
+
 if __name__ == "__main__":
-    main(
-        training_config=AlignmentConfig(),
-        model_config=TinyAyaVisionConfig.for_global(),
-    )
+    main()
