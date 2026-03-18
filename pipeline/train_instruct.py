@@ -108,6 +108,13 @@ def generate_samples(
     Extracts the prompt (tokens before the first assistant response, i.e.
     where labels == -100) and runs generation. Returns a list of dicts
     with 'prompt' and 'generation' decoded strings.
+
+    To avoid image-token-count mismatches that can arise when
+    ``GenerationMixin.generate()`` internally mutates ``input_ids``
+    (e.g. via ``_cache_dependant_input_preparation`` under torch.compile /
+    DDP), we pre-compute ``inputs_embeds`` with vision features already
+    merged and pass those to ``generate()`` instead of raw ``input_ids`` +
+    ``pixel_values``.
     """
     raw = _unwrap_model(model)
     was_training = raw.training
@@ -129,16 +136,25 @@ def generate_samples(
         pixel_values = batch["pixel_values"][i].unsqueeze(0).to(device)
 
         with torch.autocast("cuda", dtype=compute_dtype):
+            # Pre-compute inputs_embeds with vision features merged so that
+            # generate() never needs to call _merge_image_features itself.
+            inputs_embeds = raw.get_input_embeddings()(prompt_ids)
+            image_features = raw.get_image_features(pixel_values)
+            inputs_embeds = raw._merge_image_features(
+                prompt_ids, inputs_embeds, image_features,
+            )
+
             gen_ids = raw.generate(
-                input_ids=prompt_ids,
+                inputs_embeds=inputs_embeds,
                 attention_mask=prompt_mask,
-                pixel_values=pixel_values,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
             )
 
-        # Decode only newly generated tokens
-        new_ids = gen_ids[0, prompt_len:]
+        # gen_ids contains [bos_token, generated_tokens…] when using
+        # inputs_embeds — the original prompt tokens are NOT present.
+        # Skip the leading dummy token to get only generated output.
+        new_ids = gen_ids[0, 1:]
         prompt_text = processor.tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
         gen_text = processor.tokenizer.decode(new_ids, skip_special_tokens=True)
 
