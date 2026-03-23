@@ -39,6 +39,7 @@ def main():
     import models  # noqa: F401 — triggers Auto class registration
 
     import lm_eval
+    import lm_eval.tasks
 
     model_args = f"pretrained={args.model_name},dtype=bfloat16,trust_remote_code=True"
     if args.backend == "vllm":
