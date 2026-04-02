@@ -73,8 +73,10 @@ class TinyAyaVisionConfig(PretrainedConfig):
         self.vision_feature_layer = vision_feature_layer
         self.vision_feature_select_strategy = vision_feature_select_strategy
         self.cache_dir = cache_dir
-        self.text_config = text_config
-        self.vision_tower_config = vision_tower_config
+        
+        # all fields are stored directly on TinyAyaVisionConfig
+        self.text_config = None
+        self.vision_tower_config = None
         super().__init__(torch_dtype=torch_dtype, **kwargs)
 
     @classmethod
